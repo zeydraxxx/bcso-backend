@@ -14,17 +14,25 @@ app.use(cors({
 const DISCORD_CLIENT_ID     = '1504256148768030800';
 const DISCORD_CLIENT_SECRET = 'dVwrMcbCC9OuRFK8rPAb-bncGplKgqE8';
 const DISCORD_REDIRECT_URI  = 'https://bcso-backend-production.up.railway.app/auth/callback';
-const DISCORD_GUILD_ID      = '1464245148035842060';
 
-const DISCORD_ADMIN_ROLES = {
+// Serveur BCSO (admin panel)
+const DISCORD_GUILD_ID      = '1464245148035842060';
+const DISCORD_ADMIN_ROLES   = {
   '1464245148421455953': 'Commandement',
   '1504268880447803403': 'Sheriff Office',
   '1464245148396421182': 'Human Resources'
 };
 
-const SUPABASE_URL = 'https://qvtlllgqrxkefwrbmmpj.supabase.co';
-const SUPABASE_KEY = 'sb_secret_C0oEx-SLCC8tfQxYM8sWMw_jd3fH5GG';
-const FRONTEND_URL = 'https://bcso-zey-deox.netlify.app';
+// Serveur candidature (pour pouvoir postuler)
+const DISCORD_CAND_GUILD_ID   = '1503182444067557508';
+const DISCORD_CAND_ROLE       = '1503182444067557509'; // Rôle requis pour candidater
+const DISCORD_REFUSE_1        = '1504421729345343559'; // Refusé 1 fois
+const DISCORD_REFUSE_2        = '1504421833112424510'; // Refusé 2 fois
+const DISCORD_REFUSE_PERM     = '1504421845716303993'; // Refusé 3 fois = permanent
+
+const SUPABASE_URL  = 'https://qvtlllgqrxkefwrbmmpj.supabase.co';
+const SUPABASE_KEY  = 'sb_secret_C0oEx-SLCC8tfQxYM8sWMw_jd3fH5GG';
+const FRONTEND_URL  = 'https://bcso-zey-deox.netlify.app';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -60,42 +68,73 @@ app.get('/auth/callback', async (req, res) => {
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
-
     const accessToken = tokenRes.data.access_token;
 
+    // Infos utilisateur
     const userRes = await axios.get('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
     const user = userRes.data;
 
+    // ── Vérifier BL ──
+    const { data: blEntry } = await supabase
+      .from('blacklist')
+      .select('reason')
+      .eq('discord_id', user.id)
+      .maybeSingle();
+
+    if (blEntry) {
+      return res.redirect(`${FRONTEND_URL}?error=blacklisted&reason=${encodeURIComponent(blEntry.reason || 'Aucune raison fournie')}`);
+    }
+
+    // ── Vérifier rôles serveur BCSO admin ──
     let isAdmin = false;
     let roleName = '';
-
     try {
       const memberRes = await axios.get(
         `https://discord.com/api/users/@me/guilds/${DISCORD_GUILD_ID}/member`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const memberRoles = memberRes.data.roles || [];
-
-      // Trouver le rôle admin le plus élevé
       for (const [roleId, name] of Object.entries(DISCORD_ADMIN_ROLES)) {
-        if (memberRoles.includes(roleId)) {
-          isAdmin = true;
-          roleName = name;
-          break;
-        }
+        if (memberRoles.includes(roleId)) { isAdmin = true; roleName = name; break; }
       }
-    } catch (e) {
-      isAdmin = false;
+    } catch {}
+
+    // ── Vérifier serveur candidature ──
+    let candStatus = 'not_in_server'; // not_in_server | no_role | refused_1 | refused_2 | refused_perm | ok
+    let candRefuseCount = 0;
+    try {
+      const candMemberRes = await axios.get(
+        `https://discord.com/api/users/@me/guilds/${DISCORD_CAND_GUILD_ID}/member`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const candRoles = candMemberRes.data.roles || [];
+
+      if (candRoles.includes(DISCORD_REFUSE_PERM)) {
+        candStatus = 'refused_perm'; candRefuseCount = 3;
+      } else if (candRoles.includes(DISCORD_REFUSE_2)) {
+        candStatus = 'refused_2'; candRefuseCount = 2;
+      } else if (candRoles.includes(DISCORD_REFUSE_1)) {
+        candStatus = 'refused_1'; candRefuseCount = 1;
+      } else if (candRoles.includes(DISCORD_CAND_ROLE)) {
+        candStatus = 'ok';
+      } else {
+        candStatus = 'no_role';
+      }
+    } catch {
+      candStatus = 'not_in_server';
     }
 
+    // ── Sauvegarder l'utilisateur ──
     await supabase.from('discord_users').upsert({
       discord_id: user.id,
       username: user.username,
       avatar: user.avatar,
       is_admin: isAdmin,
       role_name: roleName,
+      cand_status: candStatus,
+      cand_refuse_count: candRefuseCount,
       last_login: new Date().toISOString()
     }, { onConflict: 'discord_id' });
 
@@ -104,7 +143,9 @@ app.get('/auth/callback', async (req, res) => {
       username: user.username,
       avatar: user.avatar || '',
       is_admin: isAdmin ? '1' : '0',
-      role_name: roleName
+      role_name: roleName,
+      cand_status: candStatus,
+      cand_refuse_count: String(candRefuseCount)
     });
 
     res.redirect(`${FRONTEND_URL}?${params}`);
@@ -119,253 +160,198 @@ app.get('/auth/callback', async (req, res) => {
 app.get('/candidature/check/:discord_id', async (req, res) => {
   const { discord_id } = req.params;
   try {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('candidatures')
       .select('id, status')
       .eq('discord_id', discord_id)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-
-    if (error) return res.json({ exists: false, status: null });
     res.json({ exists: !!data, status: data?.status || null });
-  } catch (err) {
+  } catch {
     res.json({ exists: false, status: null });
+  }
+});
+
+// ── HISTORIQUE CANDIDATURES D'UN USER ────────────────────
+app.get('/candidature/history/:discord_id', async (req, res) => {
+  const { discord_id } = req.params;
+  try {
+    const { data } = await supabase
+      .from('candidatures')
+      .select('id, status, created_at, nom, prenom, unite, votes_yes, votes_no, notes, motivation')
+      .eq('discord_id', discord_id)
+      .order('created_at', { ascending: false });
+    res.json(data || []);
+  } catch {
+    res.json([]);
   }
 });
 
 // ── SOUMETTRE CANDIDATURE ─────────────────────────────────
 app.post('/candidature', async (req, res) => {
   const { discord_id, username, nom, prenom, age, heures, horaire, experience, unite, motivation } = req.body;
-
   if (!discord_id || !nom || !prenom || !age || !motivation) {
     return res.status(400).json({ error: 'Champs manquants' });
   }
 
-  const { data: existing } = await supabase
-    .from('candidatures')
-    .select('id, status')
-    .eq('discord_id', discord_id)
-    .in('status', ['pending', 'accepted'])
-    .maybeSingle();
+  // Vérifier BL
+  const { data: blEntry } = await supabase
+    .from('blacklist').select('reason').eq('discord_id', discord_id).maybeSingle();
+  if (blEntry) return res.status(403).json({ error: 'Vous êtes blacklisté du BCSO.' });
 
+  // Vérifier doublon
+  const { data: existing } = await supabase
+    .from('candidatures').select('id, status')
+    .eq('discord_id', discord_id).in('status', ['pending', 'accepted']).maybeSingle();
   if (existing) {
     return res.status(409).json({
-      error: existing.status === 'accepted'
-        ? 'Tu es déjà membre du BCSO !'
-        : 'Tu as déjà une candidature en attente.'
+      error: existing.status === 'accepted' ? 'Tu es déjà membre du BCSO !' : 'Tu as déjà une candidature en attente.'
     });
   }
 
   const { data, error } = await supabase.from('candidatures').insert({
-    discord_id,
-    username,
-    nom,
-    prenom,
-    age: parseInt(age),
-    heures: parseInt(heures),
-    horaire,
-    experience,
-    unite,
-    motivation,
-    status: 'pending',
-    notes: '',
-    votes_yes: 0,
-    votes_no: 0,
-    vote_fin: false,
+    discord_id, username, nom, prenom,
+    age: parseInt(age), heures: parseInt(heures),
+    horaire, experience, unite, motivation,
+    status: 'pending', notes: '', votes_yes: 0, votes_no: 0, vote_fin: false,
     created_at: new Date().toISOString()
   }).select().single();
 
-  if (error) {
-    console.error('Insert error:', error);
-    return res.status(500).json({ error: 'Erreur base de données' });
-  }
-
+  if (error) { console.error(error); return res.status(500).json({ error: 'Erreur base de données' }); }
   res.json({ success: true, id: data.id });
 });
 
 // ── RÉCUPÉRER TOUTES LES CANDIDATURES (admin) ─────────────
 app.get('/candidatures', async (req, res) => {
   const { discord_id } = req.query;
-  if (!discord_id) return res.status(401).json({ error: 'Non autorisé' });
-
-  const { data: user } = await supabase
-    .from('discord_users')
-    .select('is_admin')
-    .eq('discord_id', discord_id)
-    .maybeSingle();
-
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
 
-  const { data, error } = await supabase
-    .from('candidatures')
-    .select('*')
-    .order('created_at', { ascending: false });
-
+  const { data, error } = await supabase.from('candidatures').select('*').order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: 'Erreur BDD' });
 
-  // Pour chaque candidature, récupérer les votes individuels
-  const withVotes = await Promise.all(data.map(async (c) => {
+  // Ajouter votes + historique pour chaque candidature
+  const withDetails = await Promise.all(data.map(async (c) => {
     const { data: votes } = await supabase
-      .from('candidature_votes')
-      .select('discord_id, username, vote')
-      .eq('candidature_id', c.id);
-    return { ...c, vote_details: votes || [] };
+      .from('candidature_votes').select('discord_id, username, vote').eq('candidature_id', c.id);
+    const { data: history } = await supabase
+      .from('candidatures').select('id, status, created_at, votes_yes, votes_no, notes, unite')
+      .eq('discord_id', c.discord_id).order('created_at', { ascending: false });
+    return { ...c, vote_details: votes || [], history: (history || []).filter(h => h.id !== c.id) };
   }));
 
-  res.json(withVotes);
+  res.json(withDetails);
 });
 
-// ── VOTER POUR UNE CANDIDATURE (admin) ────────────────────
+// ── VOTER ─────────────────────────────────────────────────
 app.post('/candidature/:id/vote', async (req, res) => {
   const { discord_id, username, vote } = req.body;
   const { id } = req.params;
+  if (!['yes', 'no'].includes(vote)) return res.status(400).json({ error: 'Vote invalide' });
 
-  if (!['yes', 'no'].includes(vote)) {
-    return res.status(400).json({ error: 'Vote invalide' });
-  }
-
-  const { data: user } = await supabase
-    .from('discord_users')
-    .select('is_admin')
-    .eq('discord_id', discord_id)
-    .maybeSingle();
-
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
 
-  // Vérifier que le vote n'est pas terminé
-  const { data: cand } = await supabase
-    .from('candidatures')
-    .select('vote_fin')
-    .eq('id', id)
-    .single();
+  const { data: cand } = await supabase.from('candidatures').select('vote_fin').eq('id', id).single();
+  if (cand?.vote_fin) return res.status(400).json({ error: 'Vote clôturé' });
 
-  if (cand?.vote_fin) {
-    return res.status(400).json({ error: 'Le vote est terminé pour cette candidature' });
-  }
+  await supabase.from('candidature_votes').upsert(
+    { candidature_id: id, discord_id, username, vote, created_at: new Date().toISOString() },
+    { onConflict: 'candidature_id,discord_id' }
+  );
 
-  // Upsert du vote (remplace si déjà voté)
-  const { error: voteError } = await supabase
-    .from('candidature_votes')
-    .upsert({
-      candidature_id: id,
-      discord_id,
-      username,
-      vote,
-      created_at: new Date().toISOString()
-    }, { onConflict: 'candidature_id,discord_id' });
-
-  if (voteError) {
-    console.error('Vote error:', voteError);
-    return res.status(500).json({ error: 'Erreur lors du vote' });
-  }
-
-  // Recalculer les compteurs
-  const { data: allVotes } = await supabase
-    .from('candidature_votes')
-    .select('vote')
-    .eq('candidature_id', id);
-
+  const { data: allVotes } = await supabase.from('candidature_votes').select('vote').eq('candidature_id', id);
   const votes_yes = allVotes.filter(v => v.vote === 'yes').length;
   const votes_no  = allVotes.filter(v => v.vote === 'no').length;
-
-  await supabase
-    .from('candidatures')
-    .update({ votes_yes, votes_no })
-    .eq('id', id);
+  await supabase.from('candidatures').update({ votes_yes, votes_no }).eq('id', id);
 
   res.json({ success: true, votes_yes, votes_no });
 });
 
-// ── CLÔTURER LE VOTE (admin) ──────────────────────────────
+// ── CLÔTURER VOTE ─────────────────────────────────────────
 app.post('/candidature/:id/cloture', async (req, res) => {
   const { discord_id } = req.body;
-  const { id } = req.params;
-
-  const { data: user } = await supabase
-    .from('discord_users')
-    .select('is_admin')
-    .eq('discord_id', discord_id)
-    .maybeSingle();
-
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-
-  const { error } = await supabase
-    .from('candidatures')
-    .update({ vote_fin: true })
-    .eq('id', id);
-
-  if (error) return res.status(500).json({ error: 'Erreur BDD' });
+  await supabase.from('candidatures').update({ vote_fin: true }).eq('id', req.params.id);
   res.json({ success: true });
 });
 
-// ── METTRE À JOUR STATUT (admin) ──────────────────────────
+// ── METTRE À JOUR STATUT ──────────────────────────────────
 app.patch('/candidature/:id', async (req, res) => {
   const { discord_id, status } = req.body;
-  const { id } = req.params;
-
-  if (!['pending', 'accepted', 'rejected'].includes(status)) {
-    return res.status(400).json({ error: 'Statut invalide' });
-  }
-
-  const { data: user } = await supabase
-    .from('discord_users')
-    .select('is_admin')
-    .eq('discord_id', discord_id)
-    .maybeSingle();
-
+  if (!['pending', 'accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'Statut invalide' });
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-
-  const { error } = await supabase
-    .from('candidatures')
-    .update({ status, updated_at: new Date().toISOString() })
-    .eq('id', id);
-
-  if (error) return res.status(500).json({ error: 'Erreur BDD' });
+  await supabase.from('candidatures').update({ status, updated_at: new Date().toISOString() }).eq('id', req.params.id);
   res.json({ success: true });
 });
 
-// ── METTRE À JOUR LES NOTES (admin) ───────────────────────
+// ── NOTES ─────────────────────────────────────────────────
 app.patch('/candidature/:id/notes', async (req, res) => {
   const { discord_id, notes } = req.body;
-  const { id } = req.params;
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
+  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  await supabase.from('candidatures').update({ notes, updated_at: new Date().toISOString() }).eq('id', req.params.id);
+  res.json({ success: true });
+});
 
-  const { data: user } = await supabase
-    .from('discord_users')
-    .select('is_admin')
-    .eq('discord_id', discord_id)
-    .maybeSingle();
+// ── SUPPRIMER CANDIDATURE ─────────────────────────────────
+app.delete('/candidature/:id', async (req, res) => {
+  const { discord_id } = req.body;
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
+  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  await supabase.from('candidature_votes').delete().eq('candidature_id', req.params.id);
+  await supabase.from('candidatures').delete().eq('id', req.params.id);
+  res.json({ success: true });
+});
 
+// ── BLACKLIST : LISTER ────────────────────────────────────
+app.get('/blacklist', async (req, res) => {
+  const { discord_id } = req.query;
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
+  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  const { data } = await supabase.from('blacklist').select('*').order('created_at', { ascending: false });
+  res.json(data || []);
+});
+
+// ── BLACKLIST : AJOUTER ───────────────────────────────────
+app.post('/blacklist', async (req, res) => {
+  const { discord_id, target_discord_id, target_username, reason } = req.body;
+  const { data: user } = await supabase.from('discord_users').select('is_admin, username').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
 
-  const { error } = await supabase
-    .from('candidatures')
-    .update({ notes, updated_at: new Date().toISOString() })
-    .eq('id', id);
+  const { error } = await supabase.from('blacklist').upsert({
+    discord_id: target_discord_id,
+    username: target_username,
+    reason: reason || '',
+    added_by: user.username,
+    created_at: new Date().toISOString()
+  }, { onConflict: 'discord_id' });
 
   if (error) return res.status(500).json({ error: 'Erreur BDD' });
   res.json({ success: true });
 });
 
-// ── SUPPRIMER CANDIDATURE (admin) ─────────────────────────
-app.delete('/candidature/:id', async (req, res) => {
+// ── BLACKLIST : SUPPRIMER ─────────────────────────────────
+app.delete('/blacklist/:target_id', async (req, res) => {
   const { discord_id } = req.body;
-  const { id } = req.params;
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
+  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  await supabase.from('blacklist').delete().eq('discord_id', req.params.target_id);
+  res.json({ success: true });
+});
 
-  const { data: user } = await supabase
-    .from('discord_users')
-    .select('is_admin')
-    .eq('discord_id', discord_id)
-    .maybeSingle();
-
+// ── POLLING : données fraîches pour une candidature ───────
+app.get('/candidature/:id/live', async (req, res) => {
+  const { discord_id } = req.query;
+  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
 
-  // Supprimer aussi les votes liés
-  await supabase.from('candidature_votes').delete().eq('candidature_id', id);
-  const { error } = await supabase.from('candidatures').delete().eq('id', id);
-
-  if (error) return res.status(500).json({ error: 'Erreur BDD' });
-  res.json({ success: true });
+  const { data: cand } = await supabase.from('candidatures').select('*').eq('id', req.params.id).single();
+  const { data: votes } = await supabase.from('candidature_votes').select('discord_id, username, vote').eq('candidature_id', req.params.id);
+  res.json({ ...cand, vote_details: votes || [] });
 });
 
 // ── START ─────────────────────────────────────────────────
