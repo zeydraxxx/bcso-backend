@@ -32,7 +32,7 @@ const DISCORD_REFUSE_PERM     = '1504421845716303993'; // Refusé 3 fois = perma
 
 const SUPABASE_URL  = 'https://qvtlllgqrxkefwrbmmpj.supabase.co';
 const SUPABASE_KEY  = 'sb_secret_C0oEx-SLCC8tfQxYM8sWMw_jd3fH5GG';
-const FRONTEND_URL  = 'https://bcso-zey-deox.netlify.app';
+const FRONTEND_URL  = 'https://sheriff-academy.netlify.app';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
