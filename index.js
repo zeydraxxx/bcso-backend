@@ -1,480 +1,514 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const { createClient } = require('@supabase/supabase-js');
+import discord
+from discord.ext import commands, tasks
+from datetime import datetime
+import json
+import os
 
-const app = express();
-app.use(express.json());
-app.use(cors({
-  origin: [
-    'https://sheriff-academy.netlify.app',
-    'https://bcso-zey-deox.netlify.app',
-    'http://localhost:3000'
-  ],
-  credentials: true
-}));
+TOKEN = os.environ["TOKEN"]
+DATA_FILE = "pointages.json"
+CONFIG_FILE = "config.json"
 
-// ── CONFIG ──────────────────────────────────────────────
-const DISCORD_CLIENT_ID     = process.env.DISCORD_CLIENT_ID     || '1504256148768030800';
-const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || '';
-const DISCORD_REDIRECT_URI  = 'https://bcso-backend-production.up.railway.app/auth/callback';
-const DISCORD_BOT_TOKEN     = process.env.DISCORD_BOT_TOKEN     || '';
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-// Serveur BCSO admin
-const DISCORD_GUILD_ID    = '1464245148035842060';
-const DISCORD_ADMIN_ROLES = {
-  '1504268880447803403': 'Sheriff Office',
-  '1464245148396421182': 'Human Resources'
-};
+def load():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-// Serveur candidature
-const DISCORD_CAND_GUILD_ID = '1503182444067557508';
-const DISCORD_CAND_ROLE     = '1503182444067557509'; // Citoyen
-const DISCORD_REFUSE_1      = '1504421729345343559';
-const DISCORD_REFUSE_2      = '1504421833112424510';
-const DISCORD_REFUSE_PERM   = '1504421845716303993';
-const DISCORD_ACCEPTED_ROLE = '1503182444067557510'; // Rôle donné quand accepté
-const DISCORD_PING_ROLE     = '1503182444067557513'; // Rôle pingué lors d'une nouvelle candidature
+def save(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
-const SUPABASE_URL        = 'https://qvtlllgqrxkefwrbmmpj.supabase.co';
-const SUPABASE_KEY        = process.env.SUPABASE_KEY || '';
-const FRONTEND_URL        = 'https://sheriff-academy.netlify.app';
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
 
-// ── HELPER : Donner un rôle via le bot ───────────────────
-async function giveRole(discordUserId, guildId, roleId) {
-  if (!DISCORD_BOT_TOKEN) { console.error('Bot token manquant'); return false; }
-  try {
-    await axios.put(
-      `https://discord.com/api/v10/guilds/${guildId}/members/${discordUserId}/roles/${roleId}`,
-      {},
-      { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json', 'X-Audit-Log-Reason': 'Candidature BCSO acceptée' } }
-    );
-    console.log(`✅ Rôle ${roleId} donné à ${discordUserId}`);
-    return true;
-  } catch (err) {
-    console.error('Erreur giveRole:', err.response?.data || err.message);
-    return false;
-  }
-}
+def fmt(seconds):
+    seconds = int(max(0, seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}h{m:02d}m{s:02d}s"
 
-// ── HELPER : Retirer un rôle via le bot ──────────────────
-async function removeRole(discordUserId, guildId, roleId) {
-  if (!DISCORD_BOT_TOKEN) return false;
-  try {
-    await axios.delete(
-      `https://discord.com/api/v10/guilds/${guildId}/members/${discordUserId}/roles/${roleId}`,
-      { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'X-Audit-Log-Reason': 'Candidature BCSO refusée/annulée' } }
-    );
-    return true;
-  } catch (err) {
-    console.error('Erreur removeRole:', err.response?.data || err.message);
-    return false;
-  }
-}
+def get_elapsed(u):
+    now = datetime.utcnow().timestamp()
+    pauses = u.get("total_pauses", 0)
+    if u["status"] == "paused":
+        pauses += now - u["pause_start"]
+    return max(0, now - u["start"] - pauses + u.get("bonus_seconds", 0))
 
-// ── SANITY CHECK ─────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'BCSO Backend opérationnel ✅', bot: !!DISCORD_BOT_TOKEN });
-});
+def get_pause_duration(u):
+    now = datetime.utcnow().timestamp()
+    total = u.get("total_pauses", 0)
+    if u["status"] == "paused":
+        total += now - u["pause_start"]
+    return total
 
-// ── AUTH LOGIN ────────────────────────────────────────────
-app.get('/auth/login', (req, res) => {
-  const params = new URLSearchParams({
-    client_id: DISCORD_CLIENT_ID,
-    redirect_uri: DISCORD_REDIRECT_URI,
-    response_type: 'code',
-    scope: 'identify guilds guilds.members.read'
-  });
-  res.redirect(`https://discord.com/oauth2/authorize?${params}`);
-});
+# ─── Embeds ───────────────────────────────────────────────────
+async def build_pointeuse_embed(guild, data):
+    embed = discord.Embed(title="🕐 POINTEUSE", color=0x1abc9c)
+    en_service = [(uid, u) for uid, u in data.items() if u["status"] == "working"]
+    en_pause = [(uid, u) for uid, u in data.items() if u["status"] == "paused"]
+    lines = []
+    for uid, u in en_service:
+        member = guild.get_member(int(uid))
+        name = member.display_name if member else f"<@{uid}>"
+        lines.append(f"🟢 **{name}** — `{fmt(get_elapsed(u))}`")
+    for uid, u in en_pause:
+        member = guild.get_member(int(uid))
+        name = member.display_name if member else f"<@{uid}>"
+        lines.append(f"⏸️ **{name}** — `{fmt(get_elapsed(u))}` *(pause: {fmt(get_pause_duration(u))})*")
+    embed.description = "\n".join(lines) if lines else "*Personne en service actuellement*"
+    embed.set_footer(text=f"Blaine County Sheriff Office • {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+    return embed
 
-// ── AUTH CALLBACK ─────────────────────────────────────────
-app.get('/auth/callback', async (req, res) => {
-  const { code } = req.query;
-  if (!code) return res.redirect(`${FRONTEND_URL}?error=no_code`);
+async def build_gestion_embed(guild, data):
+    now = datetime.utcnow()
+    cfg = load_config()
+    embed = discord.Embed(title="📊 PANNEAU DE GESTION", color=0xe74c3c, timestamp=now)
+    en_service = [(uid, u) for uid, u in data.items() if u["status"] == "working"]
+    en_pause = [(uid, u) for uid, u in data.items() if u["status"] == "paused"]
+    hors_service = [(uid, u) for uid, u in data.items() if u["status"] == "off" and u.get("sessions")]
 
-  try {
-    const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
-      new URLSearchParams({
-        client_id: DISCORD_CLIENT_ID,
-        client_secret: DISCORD_CLIENT_SECRET,
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: DISCORD_REDIRECT_URI
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    const accessToken = tokenRes.data.access_token;
+    if en_service:
+        lines = []
+        for uid, u in en_service:
+            member = guild.get_member(int(uid))
+            name = member.display_name if member else f"ID:{uid}"
+            elapsed = get_elapsed(u)
+            total_all = sum(s["duree_secondes"] for s in u.get("sessions", [])) + elapsed
+            lines.append(f"🟢 **{name}**\n┣ Depuis : `{fmt(elapsed)}`\n┗ Total : `{fmt(total_all)}`")
+        embed.add_field(name="━━━ EN SERVICE ━━━", value="\n\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="━━━ EN SERVICE ━━━", value="*Personne*", inline=False)
 
-    const userRes = await axios.get('https://discord.com/api/users/@me', {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
-    const user = userRes.data;
+    if en_pause:
+        lines = []
+        for uid, u in en_pause:
+            member = guild.get_member(int(uid))
+            name = member.display_name if member else f"ID:{uid}"
+            elapsed = get_elapsed(u)
+            total_all = sum(s["duree_secondes"] for s in u.get("sessions", [])) + elapsed
+            lines.append(f"⏸️ **{name}**\n┣ Pause : `{fmt(get_pause_duration(u))}`\n┣ Travaillé : `{fmt(elapsed)}`\n┗ Total : `{fmt(total_all)}`")
+        embed.add_field(name="━━━ EN PAUSE ━━━", value="\n\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="━━━ EN PAUSE ━━━", value="*Personne*", inline=False)
 
-    // Vérifier BL
-    const { data: blEntry } = await supabase
-      .from('blacklist').select('reason').eq('discord_id', user.id).maybeSingle();
-    if (blEntry) {
-      return res.redirect(`${FRONTEND_URL}?error=blacklisted&reason=${encodeURIComponent(blEntry.reason || 'Aucune raison fournie')}`);
-    }
+    if hors_service:
+        lines = []
+        for uid, u in list(hors_service)[-5:]:
+            member = guild.get_member(int(uid))
+            name = member.display_name if member else f"ID:{uid}"
+            last = u["sessions"][-1]
+            total_all = sum(s["duree_secondes"] for s in u.get("sessions", []))
+            lines.append(f"⬛ **{name}**\n┣ Dernière : `{fmt(last['duree_secondes'])}` ({last['date']})\n┗ Total : `{fmt(total_all)}`")
+        embed.add_field(name="━━━ HORS SERVICE ━━━", value="\n\n".join(lines), inline=False)
 
-    // Récupérer guilds
-    let userGuilds = [];
-    try {
-      const guildsRes = await axios.get('https://discord.com/api/users/@me/guilds', {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      userGuilds = guildsRes.data.map(g => g.id);
-    } catch {}
+    if cfg.get("comptage_start"):
+        debut = datetime.utcfromtimestamp(cfg["comptage_start"]).strftime("%d/%m/%y à %H:%M:%S")
+        duree = fmt(now.timestamp() - cfg["comptage_start"])
+        embed.add_field(name="━━━ COMPTAGE EN COURS ━━━", value=f"▶️ Démarré le `{debut}` UTC\nDurée : `{duree}`", inline=False)
 
-    // Vérifier admin BCSO
-    let isAdmin = false;
-    let roleName = '';
-    try {
-      const memberRes = await axios.get(
-        `https://discord.com/api/users/@me/guilds/${DISCORD_GUILD_ID}/member`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      const memberRoles = memberRes.data.roles || [];
-      for (const [roleId, name] of Object.entries(DISCORD_ADMIN_ROLES)) {
-        if (memberRoles.includes(roleId)) { isAdmin = true; roleName = name; break; }
-      }
-    } catch {}
+    total_en_ligne = len(en_service) + len(en_pause)
+    embed.set_footer(text=f"👮 {total_en_ligne} agent(s) en ligne • Auto-refresh 3s")
+    return embed
 
-    // Vérifier serveur candidature
-    let candStatus = 'not_in_server';
-    let candRefuseCount = 0;
-    const inCandServer = userGuilds.includes(DISCORD_CAND_GUILD_ID);
+# ─── Vue pointeuse dynamique selon statut ────────────────────
+# Un seul message public — les boutons affichés dépendent du statut de QUI clique
+class PointeuseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    if (inCandServer) {
-      try {
-        const candMemberRes = await axios.get(
-          `https://discord.com/api/users/@me/guilds/${DISCORD_CAND_GUILD_ID}/member`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        const candRoles = candMemberRes.data.roles || [];
-        if (candRoles.includes(DISCORD_REFUSE_PERM)) {
-          candStatus = 'refused_perm'; candRefuseCount = 3;
-        } else if (candRoles.includes(DISCORD_REFUSE_2)) {
-          candStatus = 'refused_2'; candRefuseCount = 2;
-        } else if (candRoles.includes(DISCORD_REFUSE_1)) {
-          candStatus = 'refused_1'; candRefuseCount = 1;
-        } else if (candRoles.includes(DISCORD_CAND_ROLE)) {
-          candStatus = 'ok';
-        } else {
-          candStatus = 'no_role';
-        }
-      } catch { candStatus = 'no_role'; }
-    }
+    @discord.ui.button(label="▶ Prendre service", style=discord.ButtonStyle.success, custom_id="pt_prendre", row=0)
+    async def prendre(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load()
+        uid = str(interaction.user.id)
+        now = datetime.utcnow().timestamp()
+        if uid in data and data[uid]["status"] != "off":
+            await interaction.response.send_message("⚠️ Tu es déjà en service !", ephemeral=True)
+            return
+        if uid not in data:
+            data[uid] = {"status": "off", "start": None, "pause_start": None, "total_pauses": 0, "sessions": [], "bonus_seconds": 0}
+        data[uid].update({"status": "working", "start": now, "pause_start": None, "total_pauses": 0, "bonus_seconds": 0})
+        cfg = load_config()
+        if cfg.get("comptage_start"):
+            if "comptage_sessions" not in cfg:
+                cfg["comptage_sessions"] = {}
+            cfg["comptage_sessions"][uid] = {"start": now, "total": 0}
+            save_config(cfg)
+        save(data)
+        await interaction.response.send_message(f"✅ Service démarré.", ephemeral=True)
+        await refresh_all(interaction.guild)
 
-    if (isAdmin) candStatus = 'ok';
+    @discord.ui.button(label="⏸ Pause", style=discord.ButtonStyle.primary, custom_id="pt_pause", row=0)
+    async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load()
+        uid = str(interaction.user.id)
+        now = datetime.utcnow().timestamp()
+        if data.get(uid, {}).get("status") != "working":
+            await interaction.response.send_message("⚠️ Tu n'es pas en service.", ephemeral=True)
+            return
+        data[uid]["status"] = "paused"
+        data[uid]["pause_start"] = now
+        save(data)
+        await interaction.response.send_message("⏸️ Pause enregistrée.", ephemeral=True)
+        await refresh_all(interaction.guild)
 
-    // Sauvegarder/mettre à jour user
-    await supabase.from('discord_users').upsert({
-      discord_id: user.id,
-      username: user.username,
-      avatar: user.avatar,
-      is_admin: isAdmin,
-      role_name: roleName,
-      cand_status: candStatus,
-      cand_refuse_count: candRefuseCount,
-      last_login: new Date().toISOString()
-    }, { onConflict: 'discord_id' });
+    @discord.ui.button(label="▶ Reprendre", style=discord.ButtonStyle.secondary, custom_id="pt_reprendre", row=0)
+    async def reprendre(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load()
+        uid = str(interaction.user.id)
+        now = datetime.utcnow().timestamp()
+        if data.get(uid, {}).get("status") != "paused":
+            await interaction.response.send_message("⚠️ Tu n'es pas en pause.", ephemeral=True)
+            return
+        data[uid]["total_pauses"] += now - data[uid]["pause_start"]
+        data[uid]["pause_start"] = None
+        data[uid]["status"] = "working"
+        save(data)
+        await interaction.response.send_message("🟢 Service repris.", ephemeral=True)
+        await refresh_all(interaction.guild)
 
-    const params = new URLSearchParams({
-      discord_id: user.id,
-      username: user.username,
-      avatar: user.avatar || '',
-      is_admin: isAdmin ? '1' : '0',
-      role_name: roleName,
-      cand_status: candStatus,
-      cand_refuse_count: String(candRefuseCount)
-    });
+    @discord.ui.button(label="⏹ Fin de service", style=discord.ButtonStyle.danger, custom_id="pt_fin", row=0)
+    async def fin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load()
+        uid = str(interaction.user.id)
+        now = datetime.utcnow().timestamp()
+        if data.get(uid, {}).get("status") == "off":
+            await interaction.response.send_message("⚠️ Tu n'es pas en service.", ephemeral=True)
+            return
+        u = data[uid]
+        if u["status"] == "paused":
+            u["total_pauses"] += now - u["pause_start"]
+        total = get_elapsed(u)
+        cfg = load_config()
+        if cfg.get("comptage_start") and "comptage_sessions" in cfg:
+            cs = cfg["comptage_sessions"]
+            if uid in cs and cs[uid].get("start"):
+                cs[uid]["total"] += now - cs[uid]["start"]
+                cs[uid]["start"] = None
+            save_config(cfg)
+        u["sessions"].append({"date": datetime.utcnow().strftime("%Y-%m-%d"), "duree_secondes": int(total)})
+        u.update({"status": "off", "start": None, "pause_start": None, "total_pauses": 0, "bonus_seconds": 0})
+        save(data)
+        await interaction.response.send_message(f"✅ Fin de service — Temps: **{fmt(total)}**", ephemeral=True)
+        await refresh_all(interaction.guild)
 
-    res.redirect(`${FRONTEND_URL}?${params}`);
+# ─── Refresh ──────────────────────────────────────────────────
+async def refresh_pointeuse(guild, data):
+    cfg = load_config()
+    if cfg.get("pointeuse_channel_id") and cfg.get("pointeuse_msg_id"):
+        ch = guild.get_channel(cfg["pointeuse_channel_id"])
+        if ch:
+            try:
+                msg = await ch.fetch_message(cfg["pointeuse_msg_id"])
+                await msg.edit(embed=await build_pointeuse_embed(guild, data))
+            except:
+                pass
 
-  } catch (err) {
-    console.error('Auth error:', err.response?.data || err.message);
-    res.redirect(`${FRONTEND_URL}?error=auth_failed`);
-  }
-});
+async def refresh_gestion(guild, data):
+    cfg = load_config()
+    if cfg.get("gestion_channel_id") and cfg.get("gestion_msg_id"):
+        ch = guild.get_channel(cfg["gestion_channel_id"])
+        if ch:
+            try:
+                msg = await ch.fetch_message(cfg["gestion_msg_id"])
+                await msg.edit(embed=await build_gestion_embed(guild, data), view=GestionView())
+            except:
+                pass
 
-// ── REFRESH STATUS (pour actualisation sans déco) ─────────
-app.get('/auth/refresh/:discord_id', async (req, res) => {
-  const { discord_id } = req.params;
-  try {
-    // Récupérer le statut via le bot (pas besoin de token OAuth)
-    let candStatus = 'not_in_server';
-    let candRefuseCount = 0;
+async def refresh_all(guild):
+    data = load()
+    await refresh_pointeuse(guild, data)
+    await refresh_gestion(guild, data)
 
-    if (!DISCORD_BOT_TOKEN) return res.json({ error: 'Bot non configuré' });
+# ─── Vue Gestion admin ────────────────────────────────────────
+class GestionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    // Vérifier si le membre est dans le serveur candidature
-    try {
-      const memberRes = await axios.get(
-        `https://discord.com/api/v10/guilds/${DISCORD_CAND_GUILD_ID}/members/${discord_id}`,
-        { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
-      );
-      const candRoles = memberRes.data.roles || [];
-      if (candRoles.includes(DISCORD_REFUSE_PERM)) {
-        candStatus = 'refused_perm'; candRefuseCount = 3;
-      } else if (candRoles.includes(DISCORD_REFUSE_2)) {
-        candStatus = 'refused_2'; candRefuseCount = 2;
-      } else if (candRoles.includes(DISCORD_REFUSE_1)) {
-        candStatus = 'refused_1'; candRefuseCount = 1;
-      } else if (candRoles.includes(DISCORD_CAND_ROLE)) {
-        candStatus = 'ok';
-      } else {
-        candStatus = 'no_role';
-      }
-    } catch (e) {
-      if (e.response?.status === 404) candStatus = 'not_in_server';
-      else candStatus = 'no_role';
-    }
+    @discord.ui.button(label="⏹ Couper service", style=discord.ButtonStyle.danger, custom_id="admin_couper", row=0)
+    async def couper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        data = load()
+        options = self._get_options(interaction.guild, data, ["working", "paused"])
+        if not options:
+            await interaction.response.send_message("Personne en service.", ephemeral=True)
+            return
+        await interaction.response.send_message("Sélectionne le membre :", view=SelectMembreView(options, "fin"), ephemeral=True)
 
-    // Vérifier admin
-    let isAdmin = false;
-    let roleName = '';
-    try {
-      const adminMemberRes = await axios.get(
-        `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${discord_id}`,
-        { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
-      );
-      const adminRoles = adminMemberRes.data.roles || [];
-      for (const [roleId, name] of Object.entries(DISCORD_ADMIN_ROLES)) {
-        if (adminRoles.includes(roleId)) { isAdmin = true; roleName = name; break; }
-      }
-    } catch {}
+    @discord.ui.button(label="⏸ Mettre en pause", style=discord.ButtonStyle.primary, custom_id="admin_pause", row=0)
+    async def mettre_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        data = load()
+        options = self._get_options(interaction.guild, data, ["working"])
+        if not options:
+            await interaction.response.send_message("Personne en service actif.", ephemeral=True)
+            return
+        await interaction.response.send_message("Sélectionne le membre :", view=SelectMembreView(options, "pause"), ephemeral=True)
 
-    if (isAdmin) candStatus = 'ok';
+    @discord.ui.button(label="▶ Reprendre service", style=discord.ButtonStyle.secondary, custom_id="admin_reprendre", row=0)
+    async def admin_reprendre(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        data = load()
+        options = self._get_options(interaction.guild, data, ["paused"])
+        if not options:
+            await interaction.response.send_message("Personne en pause.", ephemeral=True)
+            return
+        await interaction.response.send_message("Sélectionne le membre :", view=SelectMembreView(options, "reprendre"), ephemeral=True)
 
-    // Mettre à jour en BDD
-    await supabase.from('discord_users').update({
-      is_admin: isAdmin,
-      role_name: roleName,
-      cand_status: candStatus,
-      cand_refuse_count: candRefuseCount
-    }).eq('discord_id', discord_id);
+    @discord.ui.button(label="➕ Ajouter temps", style=discord.ButtonStyle.success, custom_id="admin_add_time", row=1)
+    async def add_time(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        data = load()
+        options = self._get_options_all(interaction.guild, data)
+        if not options:
+            await interaction.response.send_message("Aucun membre enregistré.", ephemeral=True)
+            return
+        await interaction.response.send_message("Sélectionne le membre :", view=SelectMembreView(options, "add_time"), ephemeral=True)
 
-    res.json({ candStatus, candRefuseCount, isAdmin, roleName });
-  } catch (err) {
-    console.error('Refresh error:', err.message);
-    res.status(500).json({ error: 'Erreur refresh' });
-  }
-});
+    @discord.ui.button(label="➖ Retirer temps", style=discord.ButtonStyle.danger, custom_id="admin_remove_time", row=1)
+    async def remove_time(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        data = load()
+        options = self._get_options_all(interaction.guild, data)
+        if not options:
+            await interaction.response.send_message("Aucun membre enregistré.", ephemeral=True)
+            return
+        await interaction.response.send_message("Sélectionne le membre :", view=SelectMembreView(options, "remove_time"), ephemeral=True)
 
-// ── CHECK CANDIDATURE ─────────────────────────────────────
-app.get('/candidature/check/:discord_id', async (req, res) => {
-  const { discord_id } = req.params;
-  try {
-    const { data } = await supabase
-      .from('candidatures')
-      .select('id, status')
-      .eq('discord_id', discord_id)
-      .in('status', ['pending', 'accepted'])
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    res.json({ exists: !!data, status: data?.status || null });
-  } catch { res.json({ exists: false, status: null }); }
-});
+    @discord.ui.button(label="▶ Démarrer comptage", style=discord.ButtonStyle.success, custom_id="admin_comptage_start", row=2)
+    async def comptage_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        cfg = load_config()
+        if cfg.get("comptage_start"):
+            await interaction.response.send_message("⚠️ Un comptage est déjà en cours.", ephemeral=True)
+            return
+        now = datetime.utcnow().timestamp()
+        data = load()
+        sessions = {}
+        for uid, u in data.items():
+            if u["status"] in ("working", "paused"):
+                sessions[uid] = {"start": now, "total": 0}
+        cfg["comptage_start"] = now
+        cfg["comptage_sessions"] = sessions
+        save_config(cfg)
+        debut_fmt = datetime.utcnow().strftime("%d/%m/%y à %H:%M:%S")
+        await interaction.response.send_message(f"▶️ Comptage démarré le `{debut_fmt}` UTC", ephemeral=True)
+        await refresh_gestion(interaction.guild, data)
 
-// ── SOUMETTRE CANDIDATURE ─────────────────────────────────
-app.post('/candidature', async (req, res) => {
-  const {
-    discord_id, username, nom, prenom, age, heures, horaire,
-    unite, motivation, permis, permis_types, permis_arme,
-    antecedent, antecedent_details, qcm_score, qcm_total
-  } = req.body;
+    @discord.ui.button(label="⏹ Terminer comptage", style=discord.ButtonStyle.danger, custom_id="admin_comptage_end", row=2)
+    async def comptage_end(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins seulement.", ephemeral=True)
+            return
+        cfg = load_config()
+        if not cfg.get("comptage_start"):
+            await interaction.response.send_message("⚠️ Aucun comptage en cours.", ephemeral=True)
+            return
+        now = datetime.utcnow().timestamp()
+        data = load()
+        sessions = cfg.get("comptage_sessions", {})
+        for uid, u in data.items():
+            if u["status"] in ("working", "paused") and uid in sessions:
+                if sessions[uid].get("start"):
+                    sessions[uid]["total"] += now - sessions[uid]["start"]
+        debut = datetime.utcfromtimestamp(cfg["comptage_start"]).strftime("%d/%m/%y à %H:%M")
+        fin_str = datetime.utcnow().strftime("%d/%m/%y à %H:%M")
+        duree_totale = fmt(now - cfg["comptage_start"])
+        embed = discord.Embed(
+            title="📋 RÉSUMÉ DU COMPTAGE",
+            description=f"**Du** `{debut}` **au** `{fin_str}` UTC\n**Durée totale :** `{duree_totale}`",
+            color=0xf39c12,
+            timestamp=datetime.utcnow()
+        )
+        if sessions:
+            lines = []
+            for uid, s in sorted(sessions.items(), key=lambda x: x[1]["total"], reverse=True):
+                member = interaction.guild.get_member(int(uid))
+                name = member.display_name if member else f"ID:{uid}"
+                lines.append(f"👮 **{name}** — `{fmt(s['total'])}`")
+            embed.add_field(name="Temps de service par agent", value="\n".join(lines), inline=False)
+        else:
+            embed.description += "\n\n*Aucun agent enregistré.*"
+        cfg.pop("comptage_start", None)
+        cfg.pop("comptage_sessions", None)
+        save_config(cfg)
+        await interaction.response.send_message(embed=embed)
+        await refresh_gestion(interaction.guild, data)
 
-  if (!discord_id || !nom || !prenom || !age || !motivation)
-    return res.status(400).json({ error: 'Champs manquants' });
+    def _get_options(self, guild, data, statuts):
+        options = []
+        for uid, u in data.items():
+            if u["status"] in statuts:
+                member = guild.get_member(int(uid))
+                name = member.display_name if member else f"ID:{uid}"
+                label = {"working": "🟢 En service", "paused": "⏸️ En pause"}.get(u["status"], "")
+                options.append(discord.SelectOption(label=name, value=uid, description=label))
+        return options
 
-  const { data: bl } = await supabase.from('blacklist').select('reason').eq('discord_id', discord_id).maybeSingle();
-  if (bl) return res.status(403).json({ error: 'Vous êtes blacklisté du BCSO.' });
+    def _get_options_all(self, guild, data):
+        options = []
+        for uid, u in data.items():
+            member = guild.get_member(int(uid))
+            name = member.display_name if member else f"ID:{uid}"
+            label = {"working": "🟢 En service", "paused": "⏸️ En pause", "off": "⬛ Hors service"}.get(u["status"], "")
+            options.append(discord.SelectOption(label=name, value=uid, description=label))
+        return options[:25]
 
-  const { data: existing } = await supabase
-    .from('candidatures').select('id, status')
-    .eq('discord_id', discord_id).in('status', ['pending', 'accepted']).maybeSingle();
-  if (existing) return res.status(409).json({
-    error: existing.status === 'accepted' ? 'Tu es déjà membre du BCSO !' : 'Tu as déjà une candidature en attente.'
-  });
+class SelectMembreView(discord.ui.View):
+    def __init__(self, options, action):
+        super().__init__(timeout=60)
+        self.action = action
+        select = discord.ui.Select(placeholder="Choisir un membre...", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
 
-  const { data, error } = await supabase.from('candidatures').insert({
-    discord_id, username, nom, prenom,
-    age: parseInt(age), heures: parseInt(heures),
-    horaire, unite, motivation,
-    permis: permis || false,
-    permis_types: permis_types || '',
-    permis_arme: permis_arme || false,
-    antecedent: antecedent || false,
-    antecedent_details: antecedent_details || '',
-    qcm_score: qcm_score || 0,
-    qcm_total: qcm_total || 15,
-    status: 'pending', notes: '', votes_yes: 0, votes_no: 0, vote_fin: false,
-    created_at: new Date().toISOString()
-  }).select().single();
+    async def on_select(self, interaction: discord.Interaction):
+        uid = interaction.data["values"][0]
+        data = load()
+        now = datetime.utcnow().timestamp()
+        member = interaction.guild.get_member(int(uid))
+        name = member.display_name if member else f"ID:{uid}"
 
-  if (error) { console.error(error); return res.status(500).json({ error: 'Erreur base de données' }); }
+        if self.action == "fin":
+            u = data.get(uid)
+            if not u or u["status"] == "off":
+                await interaction.response.send_message(f"⚠️ **{name}** n'est pas en service.", ephemeral=True)
+                return
+            if u["status"] == "paused":
+                u["total_pauses"] += now - u["pause_start"]
+            total = get_elapsed(u)
+            cfg = load_config()
+            if cfg.get("comptage_start") and "comptage_sessions" in cfg:
+                cs = cfg["comptage_sessions"]
+                if uid in cs and cs[uid].get("start"):
+                    cs[uid]["total"] += now - cs[uid]["start"]
+                    cs[uid]["start"] = None
+                save_config(cfg)
+            u["sessions"].append({"date": datetime.utcnow().strftime("%Y-%m-%d"), "duree_secondes": int(total)})
+            u.update({"status": "off", "start": None, "pause_start": None, "total_pauses": 0, "bonus_seconds": 0})
+            save(data)
+            await interaction.response.send_message(f"✅ Service de **{name}** coupé — `{fmt(total)}`.", ephemeral=True)
+            await refresh_all(interaction.guild)
 
-  // Webhook Discord avec ping du rôle
-  if (DISCORD_WEBHOOK_URL) {
-    try {
-      const qcmPct = qcm_total > 0 ? Math.round((qcm_score / qcm_total) * 100) : 0;
-      const qcmEmoji = qcmPct >= 80 ? '🟢' : qcmPct >= 60 ? '🟡' : '🔴';
-      await axios.post(DISCORD_WEBHOOK_URL, {
-        content: `<@&${DISCORD_PING_ROLE}> 📋 Nouvelle candidature reçue sur le site !`,
-        embeds: [{
-          title: '📋 Nouvelle candidature — BCSO Sheriff Academy',
-          color: 0xC9A84C,
-          fields: [
-            { name: '👤 Candidat', value: `**${prenom} ${nom}**`, inline: true },
-            { name: '🎮 Discord', value: `${username}\n\`${discord_id}\``, inline: true },
-            { name: '🎯 Unité', value: unite, inline: true },
-            { name: '🎂 Âge RP', value: `${age} ans`, inline: true },
-            { name: '⏱️ Heures/sem', value: `${heures}h`, inline: true },
-            { name: '🕐 Horaire', value: horaire, inline: true },
-            { name: '🚗 Permis', value: permis ? (permis_types || 'Oui') : 'Non', inline: true },
-            { name: '🔫 Permis arme', value: permis_arme ? 'Oui' : 'Non', inline: true },
-            { name: '⚖️ Antécédents', value: antecedent ? `Oui — ${antecedent_details || '?'}` : 'Non', inline: true },
-            { name: `${qcmEmoji} QCM Règlement`, value: `**${qcm_score}/${qcm_total}** (${qcmPct}%)`, inline: true },
-            { name: '📝 Motivation', value: (motivation || '').substring(0, 500) + ((motivation || '').length > 500 ? '...' : '') }
-          ],
-          footer: { text: '🌐 Panel admin → sheriff-academy.netlify.app' },
-          timestamp: new Date().toISOString()
-        }]
-      });
-    } catch (e) { console.error('Webhook error:', e.message); }
-  }
+        elif self.action == "pause":
+            data[uid]["status"] = "paused"
+            data[uid]["pause_start"] = now
+            save(data)
+            await interaction.response.send_message(f"⏸️ **{name}** mis en pause.", ephemeral=True)
+            await refresh_all(interaction.guild)
 
-  res.json({ success: true, id: data.id });
-});
+        elif self.action == "reprendre":
+            data[uid]["total_pauses"] += now - data[uid]["pause_start"]
+            data[uid]["pause_start"] = None
+            data[uid]["status"] = "working"
+            save(data)
+            await interaction.response.send_message(f"🟢 **{name}** a repris le service.", ephemeral=True)
+            await refresh_all(interaction.guild)
 
-// ── RÉCUPÉRER CANDIDATURES (admin) ────────────────────────
-app.get('/candidatures', async (req, res) => {
-  const { discord_id } = req.query;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+        elif self.action in ("add_time", "remove_time"):
+            await interaction.response.send_modal(TempsModal(uid=uid, name=name, action=self.action))
 
-  const { data, error } = await supabase.from('candidatures').select('*').order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: 'Erreur BDD' });
+class TempsModal(discord.ui.Modal):
+    def __init__(self, uid, name, action):
+        label = "Ajouter du temps" if action == "add_time" else "Retirer du temps"
+        super().__init__(title=f"{label} — {name}")
+        self.uid = uid
+        self.action = action
+        self.heures = discord.ui.TextInput(label="Heures", placeholder="0", required=False, max_length=3)
+        self.minutes = discord.ui.TextInput(label="Minutes", placeholder="0", required=False, max_length=3)
+        self.add_item(self.heures)
+        self.add_item(self.minutes)
 
-  const withDetails = await Promise.all(data.map(async (c) => {
-    const { data: votes } = await supabase.from('candidature_votes').select('discord_id, username, vote').eq('candidature_id', c.id);
-    const { data: history } = await supabase.from('candidatures')
-      .select('id, status, created_at, votes_yes, votes_no, notes, unite, qcm_score, qcm_total')
-      .eq('discord_id', c.discord_id).order('created_at', { ascending: false });
-    return { ...c, vote_details: votes || [], history: (history || []).filter(h => h.id !== c.id) };
-  }));
+    async def on_submit(self, interaction: discord.Interaction):
+        data = load()
+        try:
+            h = int(self.heures.value or 0)
+            m = int(self.minutes.value or 0)
+        except ValueError:
+            await interaction.response.send_message("⚠️ Valeurs invalides.", ephemeral=True)
+            return
+        seconds = h * 3600 + m * 60
+        uid = self.uid
+        if uid not in data:
+            data[uid] = {"status": "off", "start": None, "pause_start": None, "total_pauses": 0, "sessions": [], "bonus_seconds": 0}
+        if "bonus_seconds" not in data[uid]:
+            data[uid]["bonus_seconds"] = 0
+        if data[uid]["status"] == "off":
+            if not data[uid].get("sessions"):
+                data[uid]["sessions"] = [{"date": datetime.utcnow().strftime("%Y-%m-%d"), "duree_secondes": 0}]
+            if self.action == "add_time":
+                data[uid]["sessions"][-1]["duree_secondes"] += seconds
+            else:
+                data[uid]["sessions"][-1]["duree_secondes"] = max(0, data[uid]["sessions"][-1]["duree_secondes"] - seconds)
+        else:
+            if self.action == "add_time":
+                data[uid]["bonus_seconds"] += seconds
+            else:
+                data[uid]["bonus_seconds"] -= seconds
+        save(data)
+        msg = f"➕ `{h}h{m:02d}m` ajouté" if self.action == "add_time" else f"➖ `{h}h{m:02d}m` retiré"
+        await interaction.response.send_message(msg, ephemeral=True)
+        await refresh_all(interaction.guild)
 
-  res.json(withDetails);
-});
+# ─── Commandes ────────────────────────────────────────────────
+@bot.command(name="pointeuse")
+@commands.has_permissions(administrator=True)
+async def pointeuse_cmd(ctx):
+    data = load()
+    embed = await build_pointeuse_embed(ctx.guild, data)
+    msg = await ctx.send(embed=embed, view=PointeuseView())
+    cfg = load_config()
+    cfg["pointeuse_channel_id"] = ctx.channel.id
+    cfg["pointeuse_msg_id"] = msg.id
+    save_config(cfg)
+    await ctx.message.delete()
 
-// ── AUTO-SAVE NOTES ───────────────────────────────────────
-app.patch('/candidature/:id/notes', async (req, res) => {
-  const { discord_id, notes } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  await supabase.from('candidatures').update({ notes, updated_at: new Date().toISOString() }).eq('id', req.params.id);
-  res.json({ success: true });
-});
+@bot.command(name="gestion")
+@commands.has_permissions(administrator=True)
+async def gestion_cmd(ctx):
+    data = load()
+    embed = await build_gestion_embed(ctx.guild, data)
+    msg = await ctx.send(embed=embed, view=GestionView())
+    cfg = load_config()
+    cfg["gestion_channel_id"] = ctx.channel.id
+    cfg["gestion_msg_id"] = msg.id
+    save_config(cfg)
+    await ctx.message.delete()
 
-// ── VOTER ─────────────────────────────────────────────────
-app.post('/candidature/:id/vote', async (req, res) => {
-  const { discord_id, username, vote } = req.body;
-  const { id } = req.params;
-  if (!['yes', 'no'].includes(vote)) return res.status(400).json({ error: 'Vote invalide' });
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  const { data: cand } = await supabase.from('candidatures').select('vote_fin').eq('id', id).single();
-  if (cand?.vote_fin) return res.status(400).json({ error: 'Vote clôturé' });
-  await supabase.from('candidature_votes').upsert(
-    { candidature_id: id, discord_id, username, vote, created_at: new Date().toISOString() },
-    { onConflict: 'candidature_id,discord_id' }
-  );
-  const { data: allVotes } = await supabase.from('candidature_votes').select('vote').eq('candidature_id', id);
-  const votes_yes = allVotes.filter(v => v.vote === 'yes').length;
-  const votes_no  = allVotes.filter(v => v.vote === 'no').length;
-  await supabase.from('candidatures').update({ votes_yes, votes_no }).eq('id', id);
-  res.json({ success: true, votes_yes, votes_no });
-});
+@tasks.loop(seconds=3)
+async def auto_refresh():
+    for guild in bot.guilds:
+        await refresh_all(guild)
 
-// ── CLÔTURER VOTE ─────────────────────────────────────────
-app.post('/candidature/:id/cloture', async (req, res) => {
-  const { discord_id } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  await supabase.from('candidatures').update({ vote_fin: true }).eq('id', req.params.id);
-  res.json({ success: true });
-});
+@bot.event
+async def on_ready():
+    bot.add_view(PointeuseView())
+    bot.add_view(GestionView())
+    auto_refresh.start()
+    print(f"✅ Bot connecté : {bot.user}")
 
-// ── METTRE À JOUR STATUT (avec gestion rôle bot) ─────────
-app.patch('/candidature/:id', async (req, res) => {
-  const { discord_id, status } = req.body;
-  if (!['pending', 'accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalide' });
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-
-  // Récupérer la candidature pour avoir le discord_id du candidat
-  const { data: cand } = await supabase.from('candidatures').select('discord_id, username').eq('id', req.params.id).single();
-
-  await supabase.from('candidatures').update({ status, updated_at: new Date().toISOString() }).eq('id', req.params.id);
-
-  // Gérer le rôle Discord via le bot
-  if (cand && DISCORD_BOT_TOKEN) {
-    if (status === 'accepted') {
-      // Donner le rôle accepté
-      await giveRole(cand.discord_id, DISCORD_CAND_GUILD_ID, DISCORD_ACCEPTED_ROLE);
-    } else if (status === 'rejected' || status === 'pending') {
-      // Retirer le rôle accepté si on change de statut
-      await removeRole(cand.discord_id, DISCORD_CAND_GUILD_ID, DISCORD_ACCEPTED_ROLE);
-    }
-  }
-
-  res.json({ success: true });
-});
-
-// ── SUPPRIMER CANDIDATURE ─────────────────────────────────
-app.delete('/candidature/:id', async (req, res) => {
-  const { discord_id } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  await supabase.from('candidature_votes').delete().eq('candidature_id', req.params.id);
-  await supabase.from('candidatures').delete().eq('id', req.params.id);
-  res.json({ success: true });
-});
-
-// ── BLACKLIST ─────────────────────────────────────────────
-app.get('/blacklist', async (req, res) => {
-  const { discord_id } = req.query;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  const { data } = await supabase.from('blacklist').select('*').order('created_at', { ascending: false });
-  res.json(data || []);
-});
-
-app.post('/blacklist', async (req, res) => {
-  const { discord_id, target_discord_id, target_username, reason } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin, username').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  const { error } = await supabase.from('blacklist').upsert({
-    discord_id: target_discord_id, username: target_username,
-    reason: reason || '', added_by: user.username, created_at: new Date().toISOString()
-  }, { onConflict: 'discord_id' });
-  if (error) return res.status(500).json({ error: 'Erreur BDD' });
-  res.json({ success: true });
-});
-
-app.delete('/blacklist/:target_id', async (req, res) => {
-  const { discord_id } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
-  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
-  await supabase.from('blacklist').delete().eq('discord_id', req.params.target_id);
-  res.json({ success: true });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`BCSO Backend port ${PORT} ✅`));
+bot.run(TOKEN)
