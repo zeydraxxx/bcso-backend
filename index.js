@@ -24,8 +24,13 @@ const DISCORD_BOT_TOKEN     = process.env.DISCORD_BOT_TOKEN     || '';
 const DISCORD_GUILD_ID    = '1464245148035842060';
 const DISCORD_ADMIN_ROLES = {
   '1504268880447803403': 'Sheriff Office',
+  '1464245148455141490': 'Command Staff',
   '1464245148396421182': 'Human Resources'
 };
+// Permissions par rôle :
+// Sheriff Office + Command Staff : toutes les permissions
+// Human Resources : vote seulement + voir candidatures
+const FULL_PERM_ROLES = ['Sheriff Office', 'Command Staff'];
 
 // Serveur candidature
 const DISCORD_CAND_GUILD_ID  = '1503182444067557508';
@@ -272,11 +277,13 @@ app.get('/auth/refresh/:discord_id', async (req, res) => {
         if (adminRoles.includes(roleId)) { isAdmin = true; roleName = name; break; }
       }
     }
-    // Fallback : lire is_admin depuis la BDD si le bot ne peut pas vérifier
-    if (!isAdmin) {
+    // Si le bot a pu vérifier le serveur admin → résultat définitif (pas de fallback BDD)
+    // Si le bot n'a pas pu vérifier (adminRoles===null) → fallback BDD uniquement
+    if (!isAdmin && adminRoles === null) {
       const { data: dbUser } = await supabase.from('discord_users').select('is_admin, role_name').eq('discord_id', discord_id).maybeSingle();
       if (dbUser?.is_admin) { isAdmin = true; roleName = dbUser.role_name || ''; }
     }
+    // Si adminRoles est un tableau (bot a répondu) → résultat fiable, pas de fallback
     if (isAdmin) candStatus = 'ok';
 
     // Mettre à jour en BDD
@@ -288,11 +295,24 @@ app.get('/auth/refresh/:discord_id', async (req, res) => {
       cand_refuse_count: candRefuseCount
     }, { onConflict: 'discord_id' });
 
+    console.log(`Refresh ${discord_id}: isAdmin=${isAdmin} roleName=${roleName} candStatus=${candStatus}`);
     res.json({ candStatus, candRefuseCount, isAdmin, roleName });
   } catch (err) {
     console.error('Refresh error:', err.message);
     res.status(500).json({ error: 'refresh_failed' });
   }
+});
+
+// ── RELANCER VOTE (Sheriff Office uniquement) ────────────
+app.post('/candidature/:id/relancer', async (req, res) => {
+  const { discord_id } = req.body;
+  const { data: user } = await supabase.from('discord_users').select('is_admin, role_name').eq('discord_id', discord_id).maybeSingle();
+  if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  if (!FULL_PERM_ROLES.includes(user.role_name)) return res.status(403).json({ error: 'Réservé Sheriff Office / Command Staff' });
+  // Reset votes et vote_fin
+  await supabase.from('candidature_votes').delete().eq('candidature_id', req.params.id);
+  await supabase.from('candidatures').update({ vote_fin: false, votes_yes: 0, votes_no: 0, updated_at: new Date().toISOString() }).eq('id', req.params.id);
+  res.json({ success: true });
 });
 
 // ── CHECK CANDIDATURE ─────────────────────────────────────
@@ -434,8 +454,9 @@ app.post('/candidature/:id/vote', async (req, res) => {
 // ── CLÔTURER VOTE ─────────────────────────────────────────
 app.post('/candidature/:id/cloture', async (req, res) => {
   const { discord_id } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
+  const { data: user } = await supabase.from('discord_users').select('is_admin, role_name').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  if (!FULL_PERM_ROLES.includes(user.role_name)) return res.status(403).json({ error: 'Réservé Sheriff Office / Command Staff' });
   await supabase.from('candidatures').update({ vote_fin: true }).eq('id', req.params.id);
   res.json({ success: true });
 });
@@ -444,8 +465,12 @@ app.post('/candidature/:id/cloture', async (req, res) => {
 app.patch('/candidature/:id', async (req, res) => {
   const { discord_id, status } = req.body;
   if (!['pending', 'accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalide' });
-  const { data: user } = await supabase.from('discord_users').select('is_admin').eq('discord_id', discord_id).maybeSingle();
+  const { data: user } = await supabase.from('discord_users').select('is_admin, role_name').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  // Décision finale (accepted/rejected) → Sheriff Office + Command Staff seulement
+  if (['accepted','rejected'].includes(status) && !FULL_PERM_ROLES.includes(user.role_name)) {
+    return res.status(403).json({ error: 'Réservé Sheriff Office / Command Staff' });
+  }
 
   // Récupérer la candidature pour avoir le discord_id du candidat
   const { data: cand } = await supabase.from('candidatures').select('discord_id, prenom, nom, username').eq('id', req.params.id).single();
@@ -541,8 +566,9 @@ app.get('/blacklist', async (req, res) => {
 
 app.post('/blacklist', async (req, res) => {
   const { discord_id, target_discord_id, target_username, reason } = req.body;
-  const { data: user } = await supabase.from('discord_users').select('is_admin, username').eq('discord_id', discord_id).maybeSingle();
+  const { data: user } = await supabase.from('discord_users').select('is_admin, username, role_name').eq('discord_id', discord_id).maybeSingle();
   if (!user?.is_admin) return res.status(403).json({ error: 'Accès refusé' });
+  if (!FULL_PERM_ROLES.includes(user.role_name)) return res.status(403).json({ error: 'Réservé Sheriff Office / Command Staff' });
   const { error } = await supabase.from('blacklist').upsert({
     discord_id: target_discord_id, username: target_username,
     reason: reason || '', added_by: user.username, created_at: new Date().toISOString()
