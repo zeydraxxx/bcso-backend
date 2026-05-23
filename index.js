@@ -263,14 +263,19 @@ app.get('/auth/refresh/:discord_id', async (req, res) => {
       candStatus = 'ok';
     }
 
-    // Vérifier si admin aussi
-    const adminRoles = await getMemberRoles(DISCORD_GUILD_ID, discord_id);
+    // Vérifier si admin — via bot sur serveur admin, fallback BDD
     let isAdmin = false;
     let roleName = '';
+    const adminRoles = await getMemberRoles(DISCORD_GUILD_ID, discord_id);
     if (adminRoles) {
       for (const [roleId, name] of Object.entries(DISCORD_ADMIN_ROLES)) {
         if (adminRoles.includes(roleId)) { isAdmin = true; roleName = name; break; }
       }
+    }
+    // Fallback : lire is_admin depuis la BDD si le bot ne peut pas vérifier
+    if (!isAdmin) {
+      const { data: dbUser } = await supabase.from('discord_users').select('is_admin, role_name').eq('discord_id', discord_id).maybeSingle();
+      if (dbUser?.is_admin) { isAdmin = true; roleName = dbUser.role_name || ''; }
     }
     if (isAdmin) candStatus = 'ok';
 
