@@ -467,8 +467,47 @@ app.patch('/candidature/:id', async (req, res) => {
           } catch {}
         }
       }
-    } else if (status === 'rejected' || status === 'pending') {
-      // Retirer le rôle "Accepté" si jamais il l'avait
+    } else if (status === 'rejected') {
+      // Retirer le rôle Accepté si présent
+      await removeRoleFromMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_ACCEPTED_ROLE);
+
+      // Compter le nombre de refus pour ce candidat
+      const { data: refusals } = await supabase
+        .from('candidatures')
+        .select('id')
+        .eq('discord_id', cand.discord_id)
+        .eq('status', 'rejected');
+      const refusCount = (refusals || []).length; // inclut celui qu'on vient de refuser
+
+      // Retirer les anciens rôles refus
+      await removeRoleFromMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_REFUSE_1);
+      await removeRoleFromMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_REFUSE_2);
+      await removeRoleFromMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_REFUSE_PERM);
+
+      // Donner le bon rôle selon le nombre de refus
+      if (refusCount >= 3) {
+        await addRoleToMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_REFUSE_PERM);
+      } else if (refusCount === 2) {
+        await addRoleToMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_REFUSE_2);
+      } else {
+        await addRoleToMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_REFUSE_1);
+      }
+
+      // Notif webhook
+      if (DISCORD_WEBHOOK_URL) {
+        try {
+          await axios.post(DISCORD_WEBHOOK_URL, {
+            embeds: [{
+              title: '❌ Candidature Refusée',
+              color: 0xB03030,
+              description: `La candidature de **${cand.prenom} ${cand.nom}** (\`${cand.username}\`) a été **refusée**. Refus n°${refusCount}.`,
+              timestamp: new Date().toISOString()
+            }]
+          });
+        } catch {}
+      }
+    } else if (status === 'pending') {
+      // Retirer le rôle Accepté si jamais il l'avait
       await removeRoleFromMember(DISCORD_CAND_GUILD_ID, cand.discord_id, DISCORD_ACCEPTED_ROLE);
     }
   }
