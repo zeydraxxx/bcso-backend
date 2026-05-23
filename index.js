@@ -548,6 +548,12 @@ app.post('/blacklist', async (req, res) => {
     reason: reason || '', added_by: user.username, created_at: new Date().toISOString()
   }, { onConflict: 'discord_id' });
   if (error) return res.status(500).json({ error: 'Erreur BDD' });
+
+  // Donner le rôle BL (même rôle que refus 1x) sur le serveur candidature
+  if (DISCORD_BOT_TOKEN && target_discord_id) {
+    await addRoleToMember(DISCORD_CAND_GUILD_ID, target_discord_id, DISCORD_REFUSE_1);
+  }
+
   res.json({ success: true });
 });
 
